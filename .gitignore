@@ -1,0 +1,40 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# ---- Virtual environments ----
+.venv/
+venv/
+env/
+
+# ---- Secrets / local config ----
+.env
+.env.local
+*.key
+
+# ---- Runtime data (memory, skills, traces, vector index) ----
+# The agent writes its learned state here; it should never be committed.
+data/*
+!data/.gitkeep
+
+# ---- Local embedding model cache ----
+models/
+.cache/
+
+# ---- Build artifacts (PyInstaller) ----
+build/
+dist/
+*.spec.bak
+
+# ---- Logs ----
+*.log
+logs/
+
+# ---- OS / editor noise ----
+Thumbs.db
+.DS_Store
+.idea/
+.vscode/

@@ -1,0 +1,23 @@
+# ============================================================================
+# AutoPC -- Python dependencies (Windows). Same list as pyproject.toml; prefer
+#     pip install -e .
+# which also installs the `autopc` command.
+# ============================================================================
+
+# --- Brain: Claude Agent SDK ---
+claude-agent-sdk>=0.2       # in-process MCP tools + agent sessions
+python-dotenv               # loads .env.local
+
+# --- Body: eyes + hands + vision ---
+dxcam                       # DXGI desktop-duplication screen capture (the "eyes")
+interception-python         # driver-level mouse/keyboard input (the "hands")
+opencv-python               # classical vision detectors
+numpy
+Pillow                      # image handling
+winsdk                      # native Windows OCR (Windows.Media.Ocr); Windows only
+
+# --- Memory + skills (self-learning layer) ---
+PyYAML                      # SKILL.md frontmatter
+faiss-cpu                   # archival/episodic vector index (semantic recall)
+fastembed                   # local ONNX text embeddings (no PyTorch); optional
+                            # -- memory falls back to keyword search if absent.
