@@ -50,6 +50,7 @@ from autopc.core.eyes import DXCamEyes
 from autopc.core.hands import InterceptionHands
 from autopc.core.perception import PerceptionEngine
 from autopc.core.reader import ScreenReader
+from autopc.memory import build_memory
 
 log = logging.getLogger("agent_brain")
 
@@ -91,10 +92,16 @@ automating an API; you are using the computer by sight and hand.
 - `solve(problem, context)` - hand a hard, self-contained sub-problem to the
   reasoning model and read its answer back, so deep thinking stays off the fast
   loop. Describe the problem in full; it cannot see the screen.
-- `remember(key, note)` / `recall()` - jot down and re-read facts you must keep
-  across a long task: details the task depends on that will scroll out of view.
-  These survive even when earlier screens scroll out of your memory - save them
-  once, and recall them as you go.
+- `remember(key, note)` / `recall()` - your PERSISTENT memory. `remember` saves a
+  fact that must outlive the moment: details the task depends on that will
+  scroll out of view, or durable knowledge about an app or the user (where a
+  control lives, that they prefer dark mode). `recall()` returns your recent
+  actions plus every saved fact. This memory survives screens scrolling away,
+  context compaction, AND restarts - so save what you learn once and you (and
+  future runs) keep it.
+- `memory_search(query)` - semantic search over older/archived memories, for when
+  you suspect you have done something like this before. `memory_archive(key)` and
+  `memory_recall(key)` page a fact out of and back into active memory.
 
 Coordinates are in the pixel space of the screenshot `observe` gave you. You
 point where you look, and the mouse lands there precisely.
@@ -242,7 +249,13 @@ def boot():
     from autopc.agent_brain.solver import Solver
     solver = Solver()
     desktop.attach_solver(solver)
+    # Persistent memory: learned facts (MEMORY.md) + episodic experiences (vector
+    # store). Loaded here so what the agent knew last run is available this run.
+    memory = build_memory()
+    desktop.attach_memory(memory)
     print(f"  solver  : {solver.model} (effort={solver.effort}, adaptive thinking)")
+    print(f"  memory  : {len(memory.core_memory)} core facts, "
+          f"recall={'semantic' if memory.vectors.semantic else 'keyword'}")
     print(f"  data    : {config.data_dir()}")
     print(f"  input   : {'DRY RUN (nothing is clicked or typed)' if desktop.DRY_RUN else 'LIVE'}")
     return perception, executor
@@ -313,6 +326,16 @@ async def _consume(stream, started: float, turns: int) -> int:
     return turns
 
 
+def _goal_with_memory(goal: str) -> str:
+    """Prefix a goal with the agent's current persistent memory, so it begins
+    from what it already knows rather than a blank slate each time."""
+    preamble = desktop.memory_preamble()
+    if not preamble.strip():
+        return goal
+    return (f"## What you already know (persistent memory)\n{preamble}\n\n"
+            f"## Your goal\n{goal}")
+
+
 async def run_goal(goal: str, model: str = "claude-sonnet-5-5", max_turns: int = 60,
                    budget_usd: float = 2.0):
     """Run a single goal, then tear down. Used for the one-shot CLI form."""
@@ -323,7 +346,8 @@ async def run_goal(goal: str, model: str = "claude-sonnet-5-5", max_turns: int =
     print(f"GOAL: {goal}")
     print(f"model={model}  max_turns={max_turns}")
     print("=" * 64)
-    await _consume(query(prompt=goal, options=options), time.time(), 0)
+    await _consume(query(prompt=_goal_with_memory(goal), options=options),
+                   time.time(), 0)
 
 
 class Session:
@@ -375,7 +399,7 @@ class Session:
         print(f"model={self.model}")
         print("=" * 64)
         started = time.time()
-        await self._client.query(goal)
+        await self._client.query(_goal_with_memory(goal))
         await _consume(self._client.receive_response(), started, 0)
 
 

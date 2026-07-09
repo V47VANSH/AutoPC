@@ -57,17 +57,22 @@ _SOLVER: Optional[Any] = None
 #: The observation the model was last shown. See "Why observations are stateful".
 _LAST: Optional[Observation] = None
 
-#: A durable scratchpad for a long run. The agent's conversation gets compacted
-#: as it grows, which can drop details the task depends on (names, values, file
-#: paths, steps still to do). These notes live OUTSIDE the conversation, so
-#: `recall` always returns them intact. Keyed by a short label the model chooses
-#: (e.g. "invoice_total").
-_NOTES: dict[str, str] = {}
+#: The persistent memory stack (HOT working / WARM core / COLD archival). Wired
+#: by `attach_memory()`. Unlike the conversation, this survives compaction and
+#: restarts: learned facts live in MEMORY.md and episodic experiences in a
+#: vector store, so `remember`/`recall`/`memory_search` return them intact across
+#: runs and across whole sessions. See memory/paging_manager.py.
+_MEMORY: Optional[Any] = None
 
 
 def reset_notes() -> None:
-    """Clear the run scratchpad (call at the start of a fresh task)."""
-    _NOTES.clear()
+    """Clear the working-memory scratchpad (recent actions).
+
+    Only the HOT tier is wiped -- learned Core facts and Archival experiences
+    persist on purpose, so the agent keeps what it has learned.
+    """
+    if _MEMORY is not None:
+        _MEMORY.clear_working()
 
 
 #: When True, input tools report what they would do instead of doing it.
@@ -86,6 +91,20 @@ def attach_solver(solver: Any) -> None:
     """Bind the Opus solver (agent_brain/solver.py) before running the agent."""
     global _SOLVER
     _SOLVER = solver
+
+
+def attach_memory(memory: Any) -> None:
+    """Bind the persistent memory stack (memory.build_memory())."""
+    global _MEMORY
+    _MEMORY = memory
+
+
+def memory_preamble() -> str:
+    """The agent's current persistent memory, to prepend to a goal so it starts
+    from what it already knows. Empty when no memory is attached."""
+    if _MEMORY is None:
+        return ""
+    return _MEMORY.get_full_memory_context()
 
 
 async def warm_solver() -> None:
@@ -678,49 +697,118 @@ async def solve(args: dict[str, Any]) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": reply or "(no answer returned)"}]}
 
 
-# ---------------------------------------------------------------- run memory
+# ----------------------------------------------------------- persistent memory
+# These write to the three-tier memory stack (memory/paging_manager.py), so what
+# the agent learns here OUTLIVES the conversation AND the process: Core facts go
+# to MEMORY.md, episodic experiences to a vector store, both read back on the
+# next run. This is why the agent gets better at a recurring task over time.
+
+
+def _require_memory() -> Optional[dict]:
+    if _MEMORY is None:
+        return {"content": [{"type": "text", "text":
+                 "Memory not attached. Call attach_memory() first."}],
+                "isError": True}
+    return None
 
 
 @tool(
     "remember",
-    "Save a fact you must keep for the rest of a long task -- most importantly "
-    "details the task depends on that will scroll out of view (names, values, "
-    "file paths, steps still to do). These notes are stored outside your "
-    "conversation, so they survive even when earlier screens scroll out of your "
-    "memory. Use a short, clear key; saving the same key again overwrites it.",
-    {"key": Annotated[str, "A short label, e.g. 'invoice_total'"],
+    "Save a fact to persistent memory that you must keep for the rest of a task "
+    "-- and future tasks. Most importantly details the task depends on that will "
+    "scroll out of view (names, values, file paths, steps still to do), and "
+    "durable facts about an app or the user's preferences (where a control "
+    "lives, that they use dark mode). Stored outside your conversation, so it "
+    "survives screens scrolling away, context compaction, AND restarts. Reuse a "
+    "key to update it; near-duplicate facts are merged automatically.",
+    {"key": Annotated[str, "A short, stable label, e.g. 'invoice_total' or 'edge_menu'"],
      "note": Annotated[str, "The fact to store, in full"]},
 )
 async def remember(args: dict[str, Any]) -> dict[str, Any]:
-    key = str(args.get("key", "")).strip() or f"note{len(_NOTES) + 1}"
-    _NOTES[key] = str(args.get("note", ""))
+    err = _require_memory()
+    if err:
+        return err
+    key = str(args.get("key", "")).strip() or "note"
+    _MEMORY.memory_save(key, str(args.get("note", "")))
     return {"content": [{"type": "text", "text":
-             f"Saved '{key}'. You now have {len(_NOTES)} note(s): "
-             f"{', '.join(_NOTES)}."}]}
+             f"Saved '{key}' to persistent memory ({len(_MEMORY.core_memory)} "
+             f"core facts held)."}]}
 
 
 @tool(
     "recall",
-    "Return every note you saved with `remember`. Call this when you pick a long "
-    "task back up, to reload details you may have lost to earlier screens "
-    "scrolling away.",
+    "Return your persistent memory -- recent actions (working), and every learned "
+    "fact still in Core (task scope/rules, app knowledge, user preferences). Call "
+    "this when you start a new task or section to reload what you know. For older "
+    "experiences not shown here, use memory_search.",
     {},
 )
 async def recall(args: dict[str, Any]) -> dict[str, Any]:
-    if not _NOTES:
+    err = _require_memory()
+    if err:
+        return err
+    return {"content": [{"type": "text", "text": _MEMORY.get_full_memory_context()}]}
+
+
+@tool(
+    "memory_search",
+    "Semantic search over your ARCHIVAL memory -- past experiences and facts you "
+    "archived or that scrolled out of Core. Use it when you suspect you have "
+    "solved something like this before, or need a fact you no longer see in "
+    "recall. Returns the closest matches with a relevance score.",
+    {"query": Annotated[str, "What you are trying to remember, in plain words"]},
+)
+async def memory_search(args: dict[str, Any]) -> dict[str, Any]:
+    err = _require_memory()
+    if err:
+        return err
+    hits = _MEMORY.memory_search(str(args.get("query", "")), top_k=5)
+    if not hits:
+        return {"content": [{"type": "text", "text": "No matching memories found."}]}
+    body = "\n".join(f"  [{h['score']:.2f}] {h['text']}" for h in hits)
+    return {"content": [{"type": "text", "text": "Archival matches:\n" + body}]}
+
+
+@tool(
+    "memory_archive",
+    "Move a Core fact to Archival storage to free up working context, when it is "
+    "no longer immediately relevant but you may want it later (memory_search finds "
+    "it, memory_recall brings it back).",
+    {"key": Annotated[str, "The Core memory key to archive"]},
+)
+async def memory_archive(args: dict[str, Any]) -> dict[str, Any]:
+    err = _require_memory()
+    if err:
+        return err
+    _MEMORY.memory_archive(str(args.get("key", "")))
+    return {"content": [{"type": "text", "text":
+             f"Archived '{args.get('key', '')}' (if it existed)."}]}
+
+
+@tool(
+    "memory_recall",
+    "Bring a previously archived fact back into Core memory by its exact key.",
+    {"key": Annotated[str, "The archived key to restore to Core memory"]},
+)
+async def memory_recall(args: dict[str, Any]) -> dict[str, Any]:
+    err = _require_memory()
+    if err:
+        return err
+    value = _MEMORY.memory_recall(str(args.get("key", "")))
+    if value is None:
         return {"content": [{"type": "text", "text":
-                 "No notes saved yet. Use `remember` to save details the task "
-                 "depends on."}]}
-    body = "\n".join(f"- {k}: {v}" for k, v in _NOTES.items())
-    return {"content": [{"type": "text", "text": "Your saved notes:\n" + body}]}
+                 f"No archived fact under key '{args.get('key', '')}'."}]}
+    return {"content": [{"type": "text", "text":
+             f"Recalled '{args.get('key', '')}' into Core: {value}"}]}
 
 
 #: The native computer-use surface: look, then point/type/scroll like a person,
-#: plus the `solve` tool that hands hard thinking to Claude Opus, plus the run
-#: scratchpad (remember/recall) for details the task depends on.
+#: plus the `solve` tool that hands hard thinking to Claude Opus, plus the
+#: persistent memory tools (remember/recall + archival paging).
 DESKTOP_TOOLS = [observe, click_point, hover_point, drag, type_text, type_code,
                  press_key, scroll, navigate, read_screen,
-                 solve, remember, recall]
+                 solve,
+                 remember, recall, memory_search, memory_archive, memory_recall]
 
 #: Tool names as the model sees them once the SDK namespaces the MCP server.
 ALLOWED_TOOL_NAMES = [f"mcp__desktop__{t.name}" for t in DESKTOP_TOOLS]
