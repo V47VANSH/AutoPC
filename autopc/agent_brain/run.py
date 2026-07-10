@@ -223,9 +223,15 @@ screen, and looks like success. Go to the site root and click through instead.
 
 ## Finishing
 
-Stop when the goal is visibly achieved and say what on screen proves it. If you
-cannot make progress, say specifically what you tried and what blocked you -
-do not keep going once you are out of genuinely different approaches.
+When the goal is visibly achieved, confirm it on screen, then call
+`complete_task(success=true, summary=...)` as your final action - summarise what
+you did and the on-screen evidence that proves it. If you cannot make progress,
+call `complete_task(success=false, summary=...)` and say specifically what you
+tried and what blocked you - do not keep going once you are out of genuinely
+different approaches.
+
+Always finish with `complete_task`: it records the outcome and is how you turn a
+successful multi-step run into a reusable skill you can replay next time.
 """
 
 
@@ -301,6 +307,9 @@ async def _consume(stream, started: float, turns: int) -> int:
         elif isinstance(message, AssistantMessage):
             for block in message.content:
                 if isinstance(block, TextBlock) and block.text.strip():
+                    # The assistant's reasoning -- attach it to its next action
+                    # in the trace so a crystallized skill reads as intent.
+                    desktop.note_thought(block.text)
                     print(f"  · {block.text.strip()[:300]}")
                 elif isinstance(block, ToolUseBlock):
                     turns += 1
@@ -346,6 +355,7 @@ async def run_goal(goal: str, model: str = "claude-sonnet-5-5", max_turns: int =
     print(f"GOAL: {goal}")
     print(f"model={model}  max_turns={max_turns}")
     print("=" * 64)
+    desktop.start_trace(goal)
     await _consume(query(prompt=_goal_with_memory(goal), options=options),
                    time.time(), 0)
 
@@ -399,6 +409,7 @@ class Session:
         print(f"model={self.model}")
         print("=" * 64)
         started = time.time()
+        desktop.start_trace(goal)
         await self._client.query(_goal_with_memory(goal))
         await _consume(self._client.receive_response(), started, 0)
 

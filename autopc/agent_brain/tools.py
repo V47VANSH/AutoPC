@@ -44,6 +44,7 @@ from autopc import config
 from autopc.core.executor import Executor
 from autopc.core.perception import Observation, PerceptionEngine
 from autopc.core.reader import ScreenReader
+from autopc.agent_brain.trace import TraceRecorder
 
 # Wired by `attach()` before the agent runs.
 _PERCEPTION: Optional[PerceptionEngine] = None
@@ -105,6 +106,28 @@ def memory_preamble() -> str:
     if _MEMORY is None:
         return ""
     return _MEMORY.get_full_memory_context()
+
+
+#: Records the (thought, action, outcome) steps of the current goal, so a
+#: successful multi-step run can be crystallized into a reusable skill. See
+#: agent_brain/trace.py. One recorder is reused per process; `start_trace`
+#: clears it at the start of each goal.
+_TRACE = TraceRecorder()
+
+
+def start_trace(goal: str) -> None:
+    """Begin recording a fresh goal's action trace."""
+    _TRACE.start(goal)
+
+
+def note_thought(text: str) -> None:
+    """Attach the model's latest reasoning to its next recorded action."""
+    _TRACE.note_thought(text)
+
+
+def trace() -> TraceRecorder:
+    """The current goal's trace recorder."""
+    return _TRACE
 
 
 async def warm_solver() -> None:
@@ -483,11 +506,13 @@ async def _dispatch(action: dict) -> dict[str, Any]:
         return {"content": [{"type": "text", "text":
                              "No observation yet -- call observe first."}], "isError": True}
     if DRY_RUN:
+        _remember_step(action, "dry run (not performed)", ok=True)
         return {"content": [{"type": "text", "text":
                              f"DRY RUN -- would {_describe(action)}. Nothing was "
                              "touched; the screen is unchanged."}]}
     result = await _off_loop(_EXECUTOR.execute, action, _LAST)
     if not result.ok:
+        _remember_step(action, f"FAILED: {result.detail}", ok=False)
         return {"content": [{"type": "text", "text": f"FAILED: {result.detail}"}],
                 "isError": True}
     bits = [result.detail]
@@ -496,8 +521,25 @@ async def _dispatch(action: dict) -> dict[str, Any]:
                     f"({result.change_ratio:.1%} of pixels)")
     if result.window_before != result.window_after:
         bits.append(f"active window: '{result.window_before}' -> '{result.window_after}'")
+    _remember_step(action, result.detail, ok=True)
     bits.append("Call observe to see the result before deciding what is next.")
     return {"content": [{"type": "text", "text": " | ".join(bits)}]}
+
+
+def _remember_step(action: dict, outcome: str, ok: bool) -> None:
+    """Record an executed action to the goal trace and the HOT working tier.
+
+    The trace feeds skill crystallization; the working tier makes the action
+    visible to `recall`. Both are best-effort -- a bookkeeping failure must
+    never break the action that just succeeded.
+    """
+    try:
+        step = _TRACE.record(action, outcome, ok=ok)
+        if _MEMORY is not None:
+            _MEMORY.add_to_working({"thought": step["thought"],
+                                    "action": action, "outcome": outcome})
+    except Exception:  # pragma: no cover - telemetry must not break a run
+        pass
 
 
 @tool(
@@ -802,13 +844,40 @@ async def memory_recall(args: dict[str, Any]) -> dict[str, Any]:
              f"Recalled '{args.get('key', '')}' into Core: {value}"}]}
 
 
+# --------------------------------------------------------------- finishing
+
+
+@tool(
+    "complete_task",
+    "Call this as your FINAL action when the goal is finished -- whether you "
+    "succeeded or had to give up. Report success honestly, and summarise what you "
+    "did plus the on-screen evidence that proves it (or, on failure, what blocked "
+    "you). This closes out the task: it records the outcome and is how the agent "
+    "distills a reusable skill from a successful multi-step run.",
+    {"success": Annotated[bool, "true only if the goal was genuinely achieved"],
+     "summary": Annotated[str, "What you did and the evidence it worked, or why it failed"]},
+)
+async def complete_task(args: dict[str, Any]) -> dict[str, Any]:
+    success = bool(args.get("success", False))
+    summary = str(args.get("summary", ""))
+    _TRACE.complete(success, summary)
+    # The learning step (crystallization + consolidation) runs in the run loop
+    # once the stream ends, so this tool stays instant. See agent_brain/run.py.
+    verdict = "succeeded" if success else "did not succeed"
+    return {"content": [{"type": "text", "text":
+             f"Task marked complete ({verdict}); recorded "
+             f"{len(_TRACE.meaningful_steps())} action step(s)."}]}
+
+
 #: The native computer-use surface: look, then point/type/scroll like a person,
-#: plus the `solve` tool that hands hard thinking to Claude Opus, plus the
-#: persistent memory tools (remember/recall + archival paging).
+#: plus the `solve` tool that hands hard thinking to Claude Opus, the persistent
+#: memory tools (remember/recall + archival paging), and complete_task to close
+#: out a goal and trigger skill learning.
 DESKTOP_TOOLS = [observe, click_point, hover_point, drag, type_text, type_code,
                  press_key, scroll, navigate, read_screen,
                  solve,
-                 remember, recall, memory_search, memory_archive, memory_recall]
+                 remember, recall, memory_search, memory_archive, memory_recall,
+                 complete_task]
 
 #: Tool names as the model sees them once the SDK namespaces the MCP server.
 ALLOWED_TOOL_NAMES = [f"mcp__desktop__{t.name}" for t in DESKTOP_TOOLS]
