@@ -130,6 +130,75 @@ def trace() -> TraceRecorder:
     return _TRACE
 
 
+#: Procedural memory -- the learned-skill manager and the crystallizer that
+#: distills new skills from successful runs. Wired by `attach_skills()`.
+_SKILLS: Optional[Any] = None
+_CRYSTALLIZER: Optional[Any] = None
+#: Skill names surfaced to the agent for the current goal, so we can grade them
+#: by how the goal turned out.
+_OFFERED_SKILLS: list = []
+
+
+def attach_skills(manager: Any, crystallizer: Any = None) -> None:
+    """Bind the skill manager and (optionally) the crystallizer."""
+    global _SKILLS, _CRYSTALLIZER
+    _SKILLS, _CRYSTALLIZER = manager, crystallizer
+
+
+def skills_preamble(goal: str) -> str:
+    """Relevant learned skills for a goal, to prepend so the agent can replay
+    them instead of re-reasoning. Records which skills were surfaced (for
+    grading) and returns the full steps of the best match."""
+    global _OFFERED_SKILLS
+    _OFFERED_SKILLS = []
+    if _SKILLS is None:
+        return ""
+    relevant = _SKILLS.find_relevant_skills(goal, top_k=3)
+    if not relevant:
+        return ""
+    _OFFERED_SKILLS = [r["name"] for r in relevant]
+    lines = ["## A skill you already learned may apply here",
+             "Replay it, adapting each step to what is actually on screen. If it "
+             "stops matching reality, abandon it and reason from the screen.",
+             "", "Relevant skills:"]
+    for r in relevant:
+        rate = f"{r['success_rate']:.0%}" if r.get("times_used") else "new"
+        lines.append(f"  - {r['name']}: {r['description']} [success={rate}, "
+                     f"used {r.get('times_used', 0)}x]")
+    body = _SKILLS.skill_view(relevant[0]["name"])
+    if body:
+        lines += ["", f"Full playbook for the best match "
+                  f"({relevant[0]['name']}):", body,
+                  "", "Use skill_view(name) to read any of the others."]
+    return "\n".join(lines)
+
+
+async def finish_goal() -> str:
+    """Close out a goal: grade any surfaced skills by the outcome, and
+    crystallize a new skill from a successful, novel, multi-step run. Called by
+    the run loop after the message stream ends. Best-effort."""
+    t = _TRACE
+    notes = []
+    try:
+        if _SKILLS and _OFFERED_SKILLS and t.success is not None:
+            for name in _OFFERED_SKILLS:
+                _SKILLS.grade_skill(name, bool(t.success))
+            notes.append(f"graded {len(_OFFERED_SKILLS)} skill(s) "
+                         f"({'success' if t.success else 'failure'})")
+            pruned = _SKILLS.prune_skills()
+            if pruned:
+                notes.append(f"pruned failing skill(s): {', '.join(pruned)}")
+        if _CRYSTALLIZER and t.success and not _OFFERED_SKILLS:
+            steps = t.meaningful_steps()
+            if _CRYSTALLIZER.should_crystallize(steps, True):
+                sk = await _CRYSTALLIZER.crystallize(t.goal, steps)
+                if sk is not None:
+                    notes.append(f"crystallized new skill: {sk.metadata.name}")
+    except Exception as exc:  # learning must never break the result
+        notes.append(f"skill learning skipped ({type(exc).__name__})")
+    return "; ".join(notes) or "no skill changes"
+
+
 async def warm_solver() -> None:
     """Warm the solver's Opus session so the first solve_* call isn't cold."""
     if _SOLVER is not None:
@@ -844,6 +913,27 @@ async def memory_recall(args: dict[str, Any]) -> dict[str, Any]:
              f"Recalled '{args.get('key', '')}' into Core: {value}"}]}
 
 
+# ------------------------------------------------------------------- skills
+
+
+@tool(
+    "skill_view",
+    "Read the full step-by-step playbook of a skill you have learned, by name. "
+    "The relevant skills for this goal are listed at the top of your task; the "
+    "best match's full steps are already shown there, so use this to read any of "
+    "the OTHERS before deciding which to replay.",
+    {"name": Annotated[str, "The skill name, exactly as listed"]},
+)
+async def skill_view(args: dict[str, Any]) -> dict[str, Any]:
+    if _SKILLS is None:
+        return {"content": [{"type": "text", "text": "No skills are available."}]}
+    body = _SKILLS.skill_view(str(args.get("name", "")))
+    if not body:
+        return {"content": [{"type": "text", "text":
+                 f"No skill named '{args.get('name', '')}'."}]}
+    return {"content": [{"type": "text", "text": body}]}
+
+
 # --------------------------------------------------------------- finishing
 
 
@@ -877,7 +967,7 @@ DESKTOP_TOOLS = [observe, click_point, hover_point, drag, type_text, type_code,
                  press_key, scroll, navigate, read_screen,
                  solve,
                  remember, recall, memory_search, memory_archive, memory_recall,
-                 complete_task]
+                 skill_view, complete_task]
 
 #: Tool names as the model sees them once the SDK namespaces the MCP server.
 ALLOWED_TOOL_NAMES = [f"mcp__desktop__{t.name}" for t in DESKTOP_TOOLS]

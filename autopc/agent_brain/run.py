@@ -236,7 +236,7 @@ successful multi-step run into a reusable skill you can replay next time.
 
 
 def boot():
-    """Bring up the shared hardware layer. Identical to main.py's path."""
+    """Bring up capture, input, perception, the solver, memory and skills."""
     desktop.DRY_RUN = config.env_flag("AUTOPC_DRY_RUN")
     print("Booting perception and hands...")
     eyes = DXCamEyes(target_fps=60)
@@ -259,9 +259,17 @@ def boot():
     # store). Loaded here so what the agent knew last run is available this run.
     memory = build_memory()
     desktop.attach_memory(memory)
+    # Procedural memory: learned SKILL.md playbooks, distilled by the solver model.
+    from autopc.skills import SkillCrystallizer, build_skill_manager
+    skill_mgr = build_skill_manager(vector_store=memory.vectors)
+    min_steps = config.env_int("AUTOPC_SKILL_MIN_STEPS", 5)
+    crystallizer = SkillCrystallizer(_solver_generate, skill_mgr, min_steps=min_steps)
+    desktop.attach_skills(skill_mgr, crystallizer)
+    print(f"  model   : {config.model()}")
     print(f"  solver  : {solver.model} (effort={solver.effort}, adaptive thinking)")
     print(f"  memory  : {len(memory.core_memory)} core facts, "
           f"recall={'semantic' if memory.vectors.semantic else 'keyword'}")
+    print(f"  skills  : {len(skill_mgr._index_cache)} learned")
     print(f"  data    : {config.data_dir()}")
     print(f"  input   : {'DRY RUN (nothing is clicked or typed)' if desktop.DRY_RUN else 'LIVE'}")
     return perception, executor
@@ -335,14 +343,44 @@ async def _consume(stream, started: float, turns: int) -> int:
     return turns
 
 
-def _goal_with_memory(goal: str) -> str:
-    """Prefix a goal with the agent's current persistent memory, so it begins
-    from what it already knows rather than a blank slate each time."""
-    preamble = desktop.memory_preamble()
-    if not preamble.strip():
-        return goal
-    return (f"## What you already know (persistent memory)\n{preamble}\n\n"
-            f"## Your goal\n{goal}")
+async def _solver_generate(prompt: str, system: str = "") -> str:
+    """One-shot text generation for off-hot-path work (skill crystallization).
+
+    A fresh `query()` with no tools and its own system prompt, so distilling a
+    skill never touches the driver's conversation or the solver's session.
+    """
+    opts = ClaudeAgentOptions(
+        model=os.environ.get("AUTOPC_SOLVER_MODEL", "claude-opus-5-5"),
+        system_prompt=system or "You are a careful technical writer.",
+        mcp_servers={}, tools=[], allowed_tools=[],
+        permission_mode="bypassPermissions", setting_sources=[],
+        max_turns=1, max_buffer_size=4 * 1024 * 1024,
+    )
+    chunks: list[str] = []
+    async for message in query(prompt=prompt, options=opts):
+        if isinstance(message, AssistantMessage):
+            for block in message.content:
+                if isinstance(block, TextBlock):
+                    chunks.append(block.text)
+        elif isinstance(message, ResultMessage):
+            break
+    return "".join(chunks).strip()
+
+
+def _goal_prompt(goal: str) -> str:
+    """Prefix a goal with what the agent already knows -- persistent memory and
+    any relevant learned skills -- so it starts from experience, not a blank
+    slate. `skills_preamble` also records which skills were surfaced, for
+    grading once the goal finishes."""
+    blocks = []
+    mem = desktop.memory_preamble()
+    if mem.strip():
+        blocks.append(f"## What you already know (persistent memory)\n{mem}")
+    skl = desktop.skills_preamble(goal)
+    if skl.strip():
+        blocks.append(skl)
+    blocks.append(f"## Your goal\n{goal}")
+    return "\n\n".join(blocks)
 
 
 async def run_goal(goal: str, model: str = "claude-sonnet-5-5", max_turns: int = 60,
@@ -356,8 +394,9 @@ async def run_goal(goal: str, model: str = "claude-sonnet-5-5", max_turns: int =
     print(f"model={model}  max_turns={max_turns}")
     print("=" * 64)
     desktop.start_trace(goal)
-    await _consume(query(prompt=_goal_with_memory(goal), options=options),
+    await _consume(query(prompt=_goal_prompt(goal), options=options),
                    time.time(), 0)
+    print(f"learning     : {await desktop.finish_goal()}")
 
 
 class Session:
@@ -410,8 +449,9 @@ class Session:
         print("=" * 64)
         started = time.time()
         desktop.start_trace(goal)
-        await self._client.query(_goal_with_memory(goal))
+        await self._client.query(_goal_prompt(goal))
         await _consume(self._client.receive_response(), started, 0)
+        print(f"learning     : {await desktop.finish_goal()}")
 
 
 def main() -> int:
