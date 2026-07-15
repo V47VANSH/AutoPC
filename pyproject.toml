@@ -1,0 +1,41 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "autopc"
+version = "0.1.0"
+description = "A self-learning Windows desktop agent on the Claude Agent SDK."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Vansh Bansal" }]
+keywords = ["automation", "agent", "claude", "desktop", "computer-use", "windows"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Environment :: Console",
+]
+dependencies = [
+    "claude-agent-sdk>=0.2",
+    "python-dotenv",
+    "dxcam",
+    "interception-python",
+    "opencv-python",
+    "numpy",
+    "Pillow",
+    "winsdk; sys_platform == 'win32'",
+    "PyYAML",
+    "faiss-cpu",
+    "fastembed",
+]
+
+[project.optional-dependencies]
+
+[project.scripts]
+# Makes `autopc` callable from the terminal after `pip install .` / `-e .`.
+autopc = "autopc.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["core*", "agent_brain*", "memory*", "skills*"]

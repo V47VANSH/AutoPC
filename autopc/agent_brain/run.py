@@ -3,10 +3,9 @@ Run a desktop goal through the Claude Agent SDK.
 
     python -m autopc.agent_brain.run "open notepad and type hello"
 
-`main.py` runs the same hardware on its own; this module wires it up to the
-Agent SDK instead, which brings the agent loop, context compaction, retries and
-session state, with the desktop handed to it as in-process MCP tools (see
-`agent_brain/tools.py`).
+This module wires the hardware up to the Agent SDK, which brings the agent
+loop, context compaction, retries and session state, with the desktop handed
+to it as in-process MCP tools (see `agent_brain/tools.py`).
 
 Input is live by default. Pass --dry-run (or set AUTOPC_DRY_RUN=1) to report
 each action without performing it.
