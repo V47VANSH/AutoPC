@@ -1,1 +1,1 @@
-"""AutoGuard brain: the Claude Agent SDK loop and its desktop tool surface."""
+"""AutoPC brain: the Claude Agent SDK loop and its desktop tool surface."""

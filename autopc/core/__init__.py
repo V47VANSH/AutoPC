@@ -1,1 +1,1 @@
-"""AutoGuard core: capture, perception, actuation for the native computer-use agent."""
+"""AutoPC core: capture, perception, actuation for the native computer-use agent."""

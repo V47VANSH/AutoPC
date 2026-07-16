@@ -1,6 +1,6 @@
 """Stop spawned console children from opening their own console window.
 
-When AutoGuard is built windowed (``console=False`` in the spec) it has no
+When AutoPC is built windowed (``console=False`` in the spec) it has no
 console of its own. If it then spawns a *console* child process, Windows
 allocates a brand-new visible console window for that child -- so the terminal
 we removed from the parent simply reappears on every child. The one that matters
