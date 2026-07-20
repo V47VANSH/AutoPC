@@ -348,22 +348,8 @@ async def _solver_generate(prompt: str, system: str = "") -> str:
     A fresh `query()` with no tools and its own system prompt, so distilling a
     skill never touches the driver's conversation or the solver's session.
     """
-    opts = ClaudeAgentOptions(
-        model=os.environ.get("AUTOPC_SOLVER_MODEL", "claude-opus-5-5"),
-        system_prompt=system or "You are a careful technical writer.",
-        mcp_servers={}, tools=[], allowed_tools=[],
-        permission_mode="bypassPermissions", setting_sources=[],
-        max_turns=1, max_buffer_size=4 * 1024 * 1024,
-    )
-    chunks: list[str] = []
-    async for message in query(prompt=prompt, options=opts):
-        if isinstance(message, AssistantMessage):
-            for block in message.content:
-                if isinstance(block, TextBlock):
-                    chunks.append(block.text)
-        elif isinstance(message, ResultMessage):
-            break
-    return "".join(chunks).strip()
+    from autopc.agent_brain import llm
+    return await llm.generate_text(prompt, system=system or "You are a careful technical writer.")
 
 
 def _goal_prompt(goal: str) -> str:
