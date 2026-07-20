@@ -32,10 +32,15 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+dev = ["pytest", "pytest-asyncio", "pyinstaller"]
 
 [project.scripts]
 # Makes `autopc` callable from the terminal after `pip install .` / `-e .`.
 autopc = "autopc.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["core*", "agent_brain*", "memory*", "skills*"]
+include = ["autopc*"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
