@@ -576,9 +576,8 @@ async def _dispatch(action: dict) -> dict[str, Any]:
                              "No observation yet -- call observe first."}], "isError": True}
     if DRY_RUN:
         _remember_step(action, "dry run (not performed)", ok=True)
-        return {"content": [{"type": "text", "text":
-                             f"DRY RUN -- would {_describe(action)}. Nothing was "
-                             "touched; the screen is unchanged."}]}
+        return _text(f"DRY RUN -- would {_describe(action)}. Nothing was touched; the "
+                     "screen is unchanged.")
     result = await _off_loop(_EXECUTOR.execute, action, _LAST)
     if not result.ok:
         _remember_step(action, f"FAILED: {result.detail}", ok=False)
@@ -649,10 +648,8 @@ async def read_screen(args: dict[str, Any]) -> dict[str, Any]:
     if DRY_RUN:
         # Reading scrolls the pane, so a dry run reads only what is visible.
         visible = _screen_text_block(_LAST_FRAME_SCALE or 1.0) if _LAST else ""
-        return {"content": [{"type": "text", "text":
-                             "DRY RUN -- would scroll the pane and read it; not "
-                             "scrolling. Visible text only:\n"
-                             + (visible or "(no text visible)")}]}
+        return _text("DRY RUN -- would scroll the pane and read it; not scrolling. "
+                     "Visible text only:\n" + (visible or "(no text visible)"))
     result = await _off_loop(_READER.read_full, hover_point=hover_point,
                              max_scrolls=int(args.get("max_scrolls", 10) or 10),
                              return_to_top=bool(return_to_top))
@@ -934,40 +931,258 @@ async def skill_view(args: dict[str, Any]) -> dict[str, Any]:
     return {"content": [{"type": "text", "text": body}]}
 
 
-# --------------------------------------------------------------- finishing
+# ------------------------------------------------------------- task control
+# The task layer (tasks/) gives every goal a ledger: an immutable goal, a
+# definition of done, a plan, and a progress journal on disk. These tools are
+# how the agent reads and maintains it. The runner binds the current attempt
+# with `bind_attempt()`; without one (the legacy one-shot path) they degrade to
+# a harmless message and complete_task falls back to the old unverified record.
+
+#: The live attempt (tasks/state.AttemptState) -- ledger + per-attempt counters.
+_ATTEMPT: Optional[Any] = None
+
+
+def bind_attempt(state: Any) -> None:
+    """Bind the current task attempt so the task tools and the guard hooks
+    operate on the same ledger. Pass None to unbind."""
+    global _ATTEMPT
+    _ATTEMPT = state
+
+
+def current_attempt() -> Optional[Any]:
+    return _ATTEMPT
+
+
+def _no_task() -> dict:
+    return {"content": [{"type": "text", "text":
+             "No task ledger is active for this run."}]}
+
+
+def _text(msg: str, error: bool = False) -> dict:
+    out = {"content": [{"type": "text", "text": msg}]}
+    if error:
+        out["isError"] = True
+    return out
+
+
+@tool(
+    "task_status",
+    "Read your task ledger: the goal (your ONLY objective), the definition of done "
+    "with each criterion's status, your plan, recent progress, blockers, and lessons "
+    "from earlier attempts. Call it whenever you are unsure what is left, after a "
+    "long stretch of work, or right after resuming.",
+    {"type": "object", "properties": {}},
+)
+async def task_status(args: dict[str, Any]) -> dict[str, Any]:
+    if _ATTEMPT is None:
+        return _no_task()
+    return _text(_ATTEMPT.ledger.report())
+
+
+@tool(
+    "update_plan",
+    "Write or revise your step-by-step plan for the task. Send the WHOLE plan each "
+    "time, in order. Keep exactly one step `in_progress` -- the one you are doing "
+    "now -- and mark steps `done` as you finish them, `blocked` if stuck. Revise "
+    "the plan when reality differs from it; never drop a step the goal requires.",
+    {"type": "object",
+     "properties": {"items": {"type": "array", "items": {
+         "type": "object",
+         "properties": {"text": {"type": "string"},
+                        "status": {"type": "string",
+                                   "enum": ["pending", "in_progress", "done", "blocked"]}},
+         "required": ["text", "status"]}}},
+     "required": ["items"]},
+)
+async def update_plan(args: dict[str, Any]) -> dict[str, Any]:
+    if _ATTEMPT is None:
+        return _no_task()
+    L = _ATTEMPT.ledger
+    L.set_plan(args.get("items") or [])
+    marks = {"done": "[x]", "in_progress": "[>]", "blocked": "[!]", "pending": "[ ]"}
+    body = "\n".join(f"  {marks.get(p.status, '[ ]')} {p.text}" for p in L.plan)
+    return _text(f"Plan saved:\n{body}")
+
+
+@tool(
+    "mark_criterion",
+    "Record your own assessment of one criterion of the definition of done, with "
+    "the on-screen evidence (what exactly you see that proves it). This is your "
+    "claim; completion is still checked independently against the screen.",
+    {"type": "object",
+     "properties": {"id": {"type": "string", "description": "criterion id, e.g. c1"},
+                    "met": {"type": "boolean"},
+                    "evidence": {"type": "string",
+                                 "description": "what on screen shows it (or why not)"}},
+     "required": ["id", "met", "evidence"]},
+)
+async def mark_criterion(args: dict[str, Any]) -> dict[str, Any]:
+    if _ATTEMPT is None:
+        return _no_task()
+    L = _ATTEMPT.ledger
+    cid = str(args.get("id", "")).strip()
+    if not L.mark_criterion(cid, bool(args.get("met")), str(args.get("evidence", ""))):
+        ids = ", ".join(c.id for c in L.criteria) or "none"
+        return _text(f"No criterion '{cid}'. Valid ids: {ids}.", error=True)
+    left = [c.id for c in L.unmet()]
+    return _text(f"Marked {cid}. " + (f"Still open: {', '.join(left)}." if left
+                                       else "All criteria marked met -- confirm on screen, "
+                                            "then call complete_task(success=true)."))
+
+
+@tool(
+    "log_progress",
+    "Checkpoint your progress in the task journal: what is now done, what you "
+    "learned, where things stand. The journal survives restarts and context "
+    "compaction, so a fresh session can pick up exactly here. Log after each "
+    "milestone, not after every click.",
+    {"type": "object", "properties": {"note": {"type": "string"}}, "required": ["note"]},
+)
+async def log_progress(args: dict[str, Any]) -> dict[str, Any]:
+    if _ATTEMPT is None:
+        return _no_task()
+    _ATTEMPT.ledger.log(str(args.get("note", "")))
+    return _text("Checkpoint saved.")
+
+
+@tool(
+    "report_blocker",
+    "Record something that is blocking the task. Set needs_user=true ONLY when the "
+    "obstacle is something only the user can resolve -- a password or 2FA code you "
+    "were not given, a permission prompt that needs them, missing information that "
+    "cannot be found on the machine, a physical action. Ordinary difficulties (a "
+    "control you cannot find, an unexpected dialog) are not user blockers: record "
+    "them and keep working around them.",
+    {"type": "object",
+     "properties": {"description": {"type": "string"},
+                    "needs_user": {"type": "boolean"}},
+     "required": ["description"]},
+)
+async def report_blocker(args: dict[str, Any]) -> dict[str, Any]:
+    if _ATTEMPT is None:
+        return _no_task()
+    needs_user = bool(args.get("needs_user", False))
+    _ATTEMPT.ledger.add_blocker(str(args.get("description", "")), needs_user=needs_user)
+    if needs_user:
+        return _text("Blocker recorded as needing the user. If nothing else in the task can "
+                     "proceed without them, call complete_task(success=false) with what they "
+                     "need to provide.")
+    return _text("Blocker recorded. Work around it -- try a different route to the same "
+                 "outcome.")
+
+
+async def _screen_evidence() -> tuple:
+    """A FRESH observation for verification: screenshot, window title, OCR text.
+    Deliberately not stored in _LAST -- the model has not seen this frame, so
+    pointer tools must keep resolving against the one it has."""
+    obs = await _off_loop(_PERCEPTION.observe)
+    shot = obs.screenshot
+    window = getattr(obs.foreground, "title", "") if obs.foreground else ""
+    text = ""
+    try:
+        lines = await _off_loop(_PERCEPTION._ocr_lines_for, shot)
+        lines = [l for l in lines if (l.text or "").strip()]
+        lines.sort(key=lambda l: (l.rect[1], l.rect[0]))
+        text = "\n".join(l.text.strip() for l in lines[:150])
+    except Exception:
+        pass
+    return shot, window, text
+
+
+#: Giving up is accepted on the second request in an attempt (the first gets a
+#: "try another approach" pushback), or immediately with a needs-user blocker.
+FAILURE_CLAIMS_TO_GIVE_UP = 2
+
+_GIVE_UP_PUSHBACK = (
+    "NOT ACCEPTED YET. Completing this task is your only objective, and giving up "
+    "is a last resort. Before giving up:\n"
+    "  1. Call task_status and re-read the goal and the definition of done.\n"
+    "  2. List the approaches you have NOT tried yet: keyboard shortcuts, a different "
+    "menu or app, the Start-menu search, scrolling to hidden controls, closing a "
+    "dialog that is in the way, reopening the app, searching the web for how.\n"
+    "  3. Try the most promising one now.\n"
+    "If the task is blocked by something only the user can provide (a password, a "
+    "permission, missing information, a physical action), call "
+    "report_blocker(description, needs_user=true) and then complete_task(success=false)."
+)
 
 
 @tool(
     "complete_task",
-    "Call this as your FINAL action when the goal is finished -- whether you "
-    "succeeded or had to give up. Report success honestly, and summarise what you "
-    "did plus the on-screen evidence that proves it (or, on failure, what blocked "
-    "you). This closes out the task: it records the outcome and is how the agent "
-    "distills a reusable skill from a successful multi-step run.",
-    {"success": Annotated[bool, "true only if the goal was genuinely achieved"],
-     "summary": Annotated[str, "What you did and the evidence it worked, or why it failed"]},
+    "Claim the task is finished. With success=true your claim is INDEPENDENTLY "
+    "VERIFIED against a fresh screenshot and the definition of done -- if anything "
+    "is not visibly done you will be told exactly what, and you keep working. Only "
+    "call it once every criterion is met and visible. success=false is for a task "
+    "you genuinely cannot finish; see report_blocker.",
+    {"type": "object",
+     "properties": {"success": {"type": "boolean"},
+                    "summary": {"type": "string",
+                                "description": "what you did and the on-screen evidence, "
+                                               "or exactly what blocks you"}},
+     "required": ["success", "summary"]},
 )
 async def complete_task(args: dict[str, Any]) -> dict[str, Any]:
     success = bool(args.get("success", False))
     summary = str(args.get("summary", ""))
-    _TRACE.complete(success, summary)
-    # The learning step (crystallization + consolidation) runs in the run loop
-    # once the stream ends, so this tool stays instant. See agent_brain/run.py.
-    verdict = "succeeded" if success else "did not succeed"
-    return {"content": [{"type": "text", "text":
-             f"Task marked complete ({verdict}); recorded "
-             f"{len(_TRACE.meaningful_steps())} action step(s)."}]}
+
+    if _ATTEMPT is None:
+        # Legacy path (no ledger): record the self-report as before.
+        _TRACE.complete(success, summary)
+        return _text(f"Task marked complete ({'succeeded' if success else 'did not succeed'}); "
+                     f"recorded {len(_TRACE.meaningful_steps())} action step(s).")
+
+    A, L = _ATTEMPT, _ATTEMPT.ledger
+    if success:
+        err = _require_wired()
+        if err:
+            return err
+        from autopc.tasks.verifier import decide, record, verify
+        shot, window, text = await _screen_evidence()
+        verdict = await verify(L, screenshot=shot, screen_text=text, window=window,
+                               claim=summary,
+                               model=os.environ.get("AUTOPC_VERIFIER_MODEL") or None)
+        accepted, msg = decide(verdict, L, A.uncertain_rejections)
+        record(L, verdict, accepted)
+        if accepted:
+            L.finish("verified", summary)
+            _TRACE.complete(True, summary)
+            return _text(msg + "\nThe task is complete. End your turn now with a one-line "
+                         "summary -- take no further actions.")
+        A.rejected_claims += 1
+        if verdict.overall == "uncertain":
+            A.uncertain_rejections += 1
+        L.save()
+        return _text(msg)
+
+    # success == false: a give-up request.
+    A.failure_claims += 1
+    if L.has_user_blocker():
+        L.finish("needs_user", summary)
+        _TRACE.complete(False, summary)
+        return _text("Recorded: this task needs the user before it can continue. "
+                     "End your turn now with what they need to provide.")
+    if A.failure_claims >= FAILURE_CLAIMS_TO_GIVE_UP:
+        A.gave_up = True
+        L.log(f"Agent gave up this attempt: {summary}")
+        _TRACE.complete(False, summary)
+        return _text("Recorded. This attempt will end; what you tried and why it failed will be "
+                     "reviewed before the next attempt. End your turn now.")
+    L.log(f"Give-up request pushed back: {summary}")
+    return _text(_GIVE_UP_PUSHBACK)
 
 
-#: The native computer-use surface: look, then point/type/scroll like a person,
-#: plus the `solve` tool that hands hard thinking to Claude Opus, the persistent
-#: memory tools (remember/recall + archival paging), and complete_task to close
-#: out a goal and trigger skill learning.
+#: The desktop surface: look, then point/type/scroll, plus the `solve` tool that
+#: hands hard thinking to the reasoning model, the persistent memory tools
+#: (remember/recall + archival paging), the task-control tools that keep a long
+#: task anchored to its definition of done, and complete_task -- a verified
+#: completion gate.
 DESKTOP_TOOLS = [observe, click_point, hover_point, drag, type_text, type_code,
                  press_key, scroll, navigate, read_screen,
                  solve,
                  remember, recall, memory_search, memory_archive, memory_recall,
-                 skill_view, complete_task]
+                 skill_view,
+                 task_status, update_plan, mark_criterion, log_progress,
+                 report_blocker, complete_task]
 
 #: Tool names as the model sees them once the SDK namespaces the MCP server.
 ALLOWED_TOOL_NAMES = [f"mcp__desktop__{t.name}" for t in DESKTOP_TOOLS]
