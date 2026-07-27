@@ -145,6 +145,16 @@ def attach_skills(manager: Any, crystallizer: Any = None) -> None:
     _SKILLS, _CRYSTALLIZER = manager, crystallizer
 
 
+def get_memory() -> Optional[Any]:
+    """The attached persistent memory stack (or None)."""
+    return _MEMORY
+
+
+def get_skills() -> Optional[Any]:
+    """The attached skill manager (or None)."""
+    return _SKILLS
+
+
 def skills_preamble(goal: str) -> str:
     """Relevant learned skills for a goal, to prepend so the agent can replay
     them instead of re-reasoning. Records which skills were surfaced (for

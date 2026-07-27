@@ -274,11 +274,16 @@ def boot():
     return perception, executor
 
 
-def _build_options(model: str, max_turns: int, budget_usd: float) -> ClaudeAgentOptions:
+def _build_options(model: str, max_turns: int, budget_usd: float,
+                   hooks: Optional[dict] = None) -> ClaudeAgentOptions:
     return ClaudeAgentOptions(
         model=model,
         system_prompt=SYSTEM_PROMPT,
         mcp_servers={"desktop": desktop.desktop_server()},
+        # Goal-reinforcement hooks (tasks/guard.py): the Stop gate, periodic
+        # re-anchoring, loop/stall detection, and compaction recovery. None on
+        # the legacy one-shot path.
+        hooks=hooks,
         # No built-in tools at all. Two reasons: Read/Write/Bash/WebSearch are
         # irrelevant to driving a desktop and cost prefix tokens every turn,
         # and with a large built-in set the CLI defers tool loading, which can
