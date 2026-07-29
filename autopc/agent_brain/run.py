@@ -1,22 +1,18 @@
 """
-Run a desktop goal through the Claude Agent SDK.
+Boot the desktop agent and wire it to the Claude Agent SDK.
 
-    python -m autopc.agent_brain.run "open notepad and type hello"
-
-This module wires the hardware up to the Agent SDK, which brings the agent
-loop, context compaction, retries and session state, with the desktop handed
-to it as in-process MCP tools (see `agent_brain/tools.py`).
-
-Input is live by default. Pass --dry-run (or set AUTOPC_DRY_RUN=1) to report
-each action without performing it.
+`boot()` brings up the body (capture, input, perception), the reasoning solver,
+memory and skills. `boot_runner()` returns a `TaskRunner` (agent_brain/runner.py)
+that drives each goal to a verified finish, with the desktop handed to the SDK
+as in-process MCP tools (agent_brain/tools.py). The CLI (autopc/cli.py) is the
+only entry point that calls these.
 """
 from __future__ import annotations
 
-import asyncio
 import logging
 import os
-import sys
 import time
+from typing import Optional
 
 # DPI awareness must be declared before dxcam loads or any window exists, or
 # the capture grid and the click grid disagree.
@@ -25,25 +21,19 @@ from autopc.core.display import assert_coordinate_spaces_agree, ensure_dpi_aware
 ensure_dpi_aware()
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
-from dotenv import load_dotenv
-
-load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.dirname(
-    os.path.abspath(__file__))), ".env.local"))
-
-from typing import Optional
-
 # Suppress the console window Windows would otherwise allocate for spawned
 # console children (esp. the SDK's claude.exe). Must load before the SDK spawns
 # anything -- importing it applies the patch.
 from autopc.core import win_no_window  # noqa: F401
 
 from claude_agent_sdk import (
-    AssistantMessage, ClaudeAgentOptions, ClaudeSDKClient, ResultMessage,
-    SystemMessage, TextBlock, ToolUseBlock, query,
+    AssistantMessage, ClaudeAgentOptions, ResultMessage, SystemMessage,
+    TextBlock, ToolUseBlock,
 )
 
 from autopc import config
 from autopc.agent_brain import tools as desktop
+from autopc.core.control import CONTROL
 from autopc.core.executor import Executor
 from autopc.core.eyes import DXCamEyes
 from autopc.core.hands import InterceptionHands
@@ -104,6 +94,34 @@ automating an API; you are using the computer by sight and hand.
 
 Coordinates are in the pixel space of the screenshot `observe` gave you. You
 point where you look, and the mouse lands there precisely.
+
+## Your task is your only objective
+
+You are given ONE task and a **definition of done**: a short list of criteria,
+each an end-state you can confirm by looking at the screen. Completing every
+criterion is the entire point of this session. Nothing else matters, and you add
+nothing the task did not ask for.
+
+- `task_status()` - re-read the goal, the definition of done (with each
+  criterion's status), your plan, recent progress, and lessons from earlier
+  attempts. Call it when you are unsure what is left, or right after resuming.
+- `update_plan(items)` - keep a short ordered plan; exactly one step
+  `in_progress`. Revise it when reality differs, but never drop a step the goal
+  needs.
+- `log_progress(note)` - checkpoint a milestone. The journal survives restarts
+  and context compaction, so a later session resumes exactly here.
+- `mark_criterion(id, met, evidence)` - record, with the on-screen evidence,
+  whether a criterion is met. This is your claim; it is checked independently.
+- `report_blocker(description, needs_user)` - note an obstacle. Set
+  `needs_user=true` ONLY for something you genuinely cannot do yourself (a
+  password/2FA you were not given, information that exists nowhere on the
+  machine, a physical action). Everything else you work around.
+
+You run UNATTENDED. No one will answer a question or make a choice for you -
+when something is ambiguous, pick the reasonable reading that best serves the
+goal and keep going. Never stop to ask.
+
+`complete_task(success=false, ...)`.
 
 ## Pointing well
 
@@ -220,17 +238,25 @@ which sends the URL into a search box on the page instead of the address bar.
 Do not guess URL paths you have not seen. A wrong path 404s, repaints the
 screen, and looks like success. Go to the site root and click through instead.
 
-## Finishing
+## Finishing - completion is verified, so claim it honestly
 
-When the goal is visibly achieved, confirm it on screen, then call
-`complete_task(success=true, summary=...)` as your final action - summarise what
-you did and the on-screen evidence that proves it. If you cannot make progress,
-call `complete_task(success=false, summary=...)` and say specifically what you
-tried and what blocked you - do not keep going once you are out of genuinely
-different approaches.
+When every criterion in the definition of done is visibly met, call
+`complete_task(success=true, summary=...)` with the on-screen evidence. Your
+claim is then checked INDEPENDENTLY against a fresh screenshot. If anything is
+not actually done you will be told exactly what is missing, and you keep
+working - so there is no point claiming early. Confirm each criterion on screen
+first (and `mark_criterion` it with the evidence). A changed screen, a closed
+dialog, or "it should have worked" is NOT done; the real end-state must be
+visible - a saved file shown in its folder, a title bar with no unsaved marker,
+a confirmation message.
 
-Always finish with `complete_task`: it records the outcome and is how you turn a
-successful multi-step run into a reusable skill you can replay next time.
+Only use `complete_task(success=false, ...)` when you genuinely cannot finish -
+and only after you have tried the different approaches available to you. If the
+block is something only the user can provide, `report_blocker(..., needs_user=true)`
+first. Giving up is a last resort: finishing the task is your only objective.
+
+This is also how you learn - a verified success becomes a reusable skill, and
+every attempt (success or not) is reflected on so the next one is better.
 """
 
 
@@ -281,8 +307,7 @@ def _build_options(model: str, max_turns: int, budget_usd: float,
         system_prompt=SYSTEM_PROMPT,
         mcp_servers={"desktop": desktop.desktop_server()},
         # Goal-reinforcement hooks (tasks/guard.py): the Stop gate, periodic
-        # re-anchoring, loop/stall detection, and compaction recovery. None on
-        # the legacy one-shot path.
+        # re-anchoring, loop/stall detection, and compaction recovery.
         hooks=hooks,
         # No built-in tools at all. Two reasons: Read/Write/Bash/WebSearch are
         # irrelevant to driving a desktop and cost prefix tokens every turn,
@@ -357,132 +382,33 @@ async def _solver_generate(prompt: str, system: str = "") -> str:
     return await llm.generate_text(prompt, system=system or "You are a careful technical writer.")
 
 
-def _goal_prompt(goal: str) -> str:
-    """Prefix a goal with what the agent already knows -- persistent memory and
-    any relevant learned skills -- so it starts from experience, not a blank
-    slate. `skills_preamble` also records which skills were surfaced, for
-    grading once the goal finishes."""
-    blocks = []
-    mem = desktop.memory_preamble()
-    if mem.strip():
-        blocks.append(f"## What you already know (persistent memory)\n{mem}")
-    skl = desktop.skills_preamble(goal)
-    if skl.strip():
-        blocks.append(skl)
-    blocks.append(f"## Your goal\n{goal}")
-    return "\n\n".join(blocks)
+def build_runner(model: str, max_turns: int = 80, budget_usd: float = 4.0,
+                 max_attempts: Optional[int] = None):
+    """Construct a TaskRunner wired to this module's options and stream consumer.
+    Call boot() (and warm_solver()) first. Reused across tasks in a long session
+    -- the hardware stays up; each task still runs fresh attempts."""
+    from autopc.agent_brain.runner import TaskRunner
+    from autopc.tasks import build_task_store
+    return TaskRunner(build_task_store(), consume=_consume, build_options=_build_options,
+                      model=model, max_turns=max_turns, budget_usd=budget_usd,
+                      max_attempts=max_attempts)
 
 
-async def run_goal(goal: str, model: str = "claude-sonnet-5-5", max_turns: int = 60,
-                   budget_usd: float = 2.0):
-    """Run a single goal, then tear down. Used for the one-shot CLI form."""
+async def boot_runner(model: str, max_turns: int = 80, budget_usd: float = 4.0,
+                      max_attempts: Optional[int] = None):
+    """Boot the hardware + solver once and return a ready TaskRunner."""
     boot()
-    await desktop.warm_solver()  # bring the Opus reasoner up before the goal runs
-    options = _build_options(model, max_turns, budget_usd)
-    print("=" * 64)
-    print(f"GOAL: {goal}")
-    print(f"model={model}  max_turns={max_turns}")
-    print("=" * 64)
-    desktop.start_trace(goal)
-    await _consume(query(prompt=_goal_prompt(goal), options=options),
-                   time.time(), 0)
-    print(f"learning     : {await desktop.finish_goal()}")
+    await desktop.warm_solver()
+    return build_runner(model, max_turns=max_turns, budget_usd=budget_usd,
+                        max_attempts=max_attempts)
 
 
-class Session:
-    """
-    A persistent agent session - one CLI process reused across many goals.
-
-    This exists because `query()` spawns a **fresh Claude Code subprocess on
-    every call**, and that spawn dominates the latency. Measured on this
-    machine with no tools, no image, and the prompt "say ok" -- work Haiku
-    itself answers in well under a second:
-
-        query() round trip   5.4s, then 9.8s on the next call
-
-    There is no warm path with `query()`; the second call is not faster than
-    the first because it is a different process. `ClaudeSDKClient` holds one
-    process open, so that cost is paid once per session instead of once per
-    goal. It also keeps the prompt cache warm across goals, which `query()`
-    cannot do -- every measured one-shot run reported `cache_read=0`.
-
-    The hardware boots once here too, rather than per goal.
-    """
-
-    def __init__(self, model: str = "claude-sonnet-5-5", max_turns: int = 60,
-                 budget_usd: float = 2.0):
-        self.model = model
-        self._options = _build_options(model, max_turns, budget_usd)
-        self._client: Optional[ClaudeSDKClient] = None
-
-    async def __aenter__(self) -> "Session":
-        boot()
-        self._client = ClaudeSDKClient(options=self._options)
-        t0 = time.time()
-        await self._client.connect()
-        await desktop.warm_solver()  # bring the Opus reasoner up alongside the driver
-        print(f"  agent session ready in {time.time() - t0:.1f}s "
-              f"(reused for every goal - no per-goal process spawn)\n")
-        return self
-
-    async def __aexit__(self, *exc) -> None:
-        if self._client is not None:
-            try:
-                await self._client.disconnect()
-            except Exception:
-                pass
-
-    async def run(self, goal: str) -> None:
-        print("=" * 64)
-        print(f"GOAL: {goal}")
-        print(f"model={self.model}")
-        print("=" * 64)
-        started = time.time()
-        desktop.start_trace(goal)
-        await self._client.query(_goal_prompt(goal))
-        await _consume(self._client.receive_response(), started, 0)
-        print(f"learning     : {await desktop.finish_goal()}")
-
-
-def main() -> int:
-    import argparse
-
-    logging.basicConfig(level=logging.WARNING,
-                        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
-
-    parser = argparse.ArgumentParser(
-        prog="python -m autopc.agent_brain.run",
-        description="Run a desktop goal through the Claude Agent SDK.",
-        epilog="Ctrl+C stops the run. Pass --dry-run to report actions without "
-               "performing them.",
-    )
-    parser.add_argument("goal", nargs="+", help="What the agent should accomplish")
-    parser.add_argument("--dry-run", action="store_true",
-                        help="Report each click, key press and scroll instead of "
-                             "performing it.")
-    parser.add_argument("--model", default=os.environ.get("AUTOPC_MODEL",
-                                                          "claude-sonnet-5-5"),
-                        help="Model id (default: claude-sonnet-5-5)")
-    parser.add_argument("--max-turns", type=int, default=60,
-                        help="Hard cap on tool calls (default: 60)")
-    parser.add_argument("--budget", type=float, default=2.0,
-                        help="Spend ceiling in USD-equivalent (default: 2.0)")
-    args = parser.parse_args()
-
-    if args.dry_run:
-        # Set before boot() reads it, so a flag and the env var behave
-        # identically.
-        os.environ["AUTOPC_DRY_RUN"] = "1"
-
-    goal = " ".join(args.goal)
-    try:
-        asyncio.run(run_goal(goal, model=args.model, max_turns=args.max_turns,
-                             budget_usd=args.budget))
-    except KeyboardInterrupt:
-        print("\ninterrupted - mouse left wherever it was")
-        return 130
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+async def shutdown() -> None:
+    """Release what boot() started: the solver session, and any stop request."""
+    solver = desktop.get_solver()
+    if solver is not None:
+        try:
+            await solver.close()
+        except Exception as exc:  # shutting down anyway
+            log.debug("solver close failed: %s", exc)
+    CONTROL.reset()

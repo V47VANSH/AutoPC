@@ -94,6 +94,11 @@ def attach_solver(solver: Any) -> None:
     _SOLVER = solver
 
 
+def get_solver() -> Optional[Any]:
+    """The attached solver (or None)."""
+    return _SOLVER
+
+
 def attach_memory(memory: Any) -> None:
     """Bind the persistent memory stack (memory.build_memory())."""
     global _MEMORY
@@ -945,8 +950,7 @@ async def skill_view(args: dict[str, Any]) -> dict[str, Any]:
 # The task layer (tasks/) gives every goal a ledger: an immutable goal, a
 # definition of done, a plan, and a progress journal on disk. These tools are
 # how the agent reads and maintains it. The runner binds the current attempt
-# with `bind_attempt()`; without one (the legacy one-shot path) they degrade to
-# a harmless message and complete_task falls back to the old unverified record.
+# with `bind_attempt()`; without one they return a harmless "no task" message.
 
 #: The live attempt (tasks/state.AttemptState) -- ledger + per-attempt counters.
 _ATTEMPT: Optional[Any] = None
@@ -1136,10 +1140,7 @@ async def complete_task(args: dict[str, Any]) -> dict[str, Any]:
     summary = str(args.get("summary", ""))
 
     if _ATTEMPT is None:
-        # Legacy path (no ledger): record the self-report as before.
-        _TRACE.complete(success, summary)
-        return _text(f"Task marked complete ({'succeeded' if success else 'did not succeed'}); "
-                     f"recorded {len(_TRACE.meaningful_steps())} action step(s).")
+        return _no_task()
 
     A, L = _ATTEMPT, _ATTEMPT.ledger
     if success:

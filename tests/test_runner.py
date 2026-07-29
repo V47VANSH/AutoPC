@@ -1,5 +1,7 @@
 """Runner orchestration: attempts loop, retry-after-reflection, verified stop,
 needs-user stop, and exhaustion -> failed. SDK and LLM calls are stubbed."""
+import asyncio
+
 import pytest
 
 from autopc.agent_brain import runner as rn
@@ -108,3 +110,17 @@ async def test_skips_contract_when_criteria_exist(tmp_path, monkeypatch):
                                  monkeypatch=monkeypatch)
     led = await _drive(runner, store, "already-scoped task")
     assert led.status == "verified"
+
+
+@pytest.mark.asyncio
+async def test_ctrl_c_saves_an_interrupted_attempt_and_reraises(tmp_path, monkeypatch):
+    def cancelled(l):
+        raise asyncio.CancelledError
+    runner, store = _make_runner(tmp_path, [cancelled], monkeypatch=monkeypatch)
+    with pytest.raises(asyncio.CancelledError):
+        await _drive(runner, store, "a long task")
+    led = store.latest_resumable()
+    assert led is not None and led.goal == "a long task"
+    assert led.status == "active"                      # resumable, not failed
+    assert led.attempts[-1].outcome == "interrupted"
+    assert runner.calls["n"] == 1                      # no retry after Ctrl+C

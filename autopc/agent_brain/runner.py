@@ -21,10 +21,13 @@ This is where the long-horizon pieces come together:
      preserved for a future `resume`).
 
 Nothing lives only in memory: the ledger is on disk throughout, so a crash
-mid-attempt loses at most the current attempt, and `resume` continues.
+mid-attempt loses at most the current attempt, and `resume` continues. A Ctrl+C
+arrives as task cancellation: the attempt is recorded as interrupted, saved, and
+the cancellation is re-raised to the caller.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import time
@@ -140,9 +143,15 @@ class TaskRunner:
             try:
                 await self._consume(query(prompt=self._attempt_prompt(ledger, attempt.n),
                                           options=options), started, 0)
-            except KeyboardInterrupt:
+            except asyncio.CancelledError:
+                # Ctrl+C. Record the attempt so `resume` picks up cleanly, then
+                # let the cancellation reach the caller.
                 state.interrupted = True
-                ledger.log("Interrupted (KeyboardInterrupt).")
+                ledger.log("Interrupted by the user mid-attempt.")
+                ledger.end_attempt("interrupted", "interrupted by the user")
+                ledger.save()
+                print(f"\nattempt {attempt.n} -> interrupted (resume with: "
+                      f"autopc resume {ledger.id})")
                 raise
             except Exception as exc:
                 log.exception("Attempt crashed")
@@ -158,6 +167,11 @@ class TaskRunner:
                 desktop.bind_attempt(None)
 
             outcome = self._outcome(ledger, state)
+            # Don't spend an LLM call reflecting on an attempt the user cut short.
+            if state.interrupted:
+                ledger.end_attempt(outcome, "interrupted by the user")
+                print(f"attempt {attempt.n} -> interrupted")
+                break
             steps = desktop.trace().steps
             r = await reflect(ledger, outcome, steps,
                               model=os.environ.get("AUTOPC_REFLECT_MODEL") or None)
@@ -165,7 +179,7 @@ class TaskRunner:
             ledger.end_attempt(outcome, r.summary)
             print(f"attempt {attempt.n} -> {outcome}: {r.summary[:160]}")
 
-            if outcome in ("verified", "needs_user", "interrupted"):
+            if outcome in ("verified", "needs_user"):
                 break
 
         ledger.save()
