@@ -35,11 +35,36 @@ autopc>
 | Survives a layout change | ✗ | ✓ | ✓ |
 | Remembers facts across runs | ✗ | ✗ | ✓ |
 | Learns reusable skills from success | ✗ | ✗ | ✓ |
-| Drives input at the kernel level | ✗ | usually ✗ | ✓ |
+| Completion checked by a separate model | n/a | ✗ | ✓ |
+| Saves progress to disk and resumes | ✗ | ✗ | ✓ |
 
-AutoPC pairs a precise **body** (kernel-level input, DPI-correct perception)
-with a learning **mind** (persistent memory + skill crystallization) on top of
-the Claude Agent SDK.
+## Finishing the task is the objective
+
+Long tasks fail in predictable ways: the agent drifts as its context fills,
+declares victory on a screen that merely *looks* done, loops on a dead approach,
+or stops to ask a question nobody will answer. AutoPC addresses each of these
+with the SDK's hooks rather than with prompt wording alone:
+
+- **A definition of done, written first.** Before acting, the goal becomes a
+  short list of criteria you can check on screen. The acting agent cannot
+  change them.
+- **Independent verification.** `complete_task` is checked by a *separate*
+  model call that judges a fresh screenshot against the criteria, with no
+  access to the agent's conversation. A premature claim is rejected with what
+  is still missing, and the agent keeps working. If the verifier itself is
+  unavailable (for example a network error), the claim is accepted only when
+  the agent has recorded on-screen evidence for every criterion, and the
+  task's log says so.
+- **A stop gate.** The agent cannot end its turn until the task is verified, a
+  user-only blocker is recorded, or it has given up after being pushed back.
+  The gate gives way after six blocked stops so a stuck agent cannot loop
+  forever; the runner then reflects and retries.
+- **Re-anchoring and loop/stall detection** throughout, with the task's state
+  saved to disk so a crash, restart or Ctrl+C loses at most the current
+  attempt.
+- **Reflection and retry.** A failed attempt is reviewed for concrete lessons;
+  the next attempt runs in a fresh context that inherits the lessons, not the
+  dead ends. `autopc resume` picks up an unfinished task later.
 
 ---
 
@@ -110,20 +135,40 @@ appropriate for what use; check it before you build on or distribute AutoPC.
 ## Usage
 
 ```bash
-autopc                       # open the interactive shell (default)
-autopc run "open notepad and type hello"
-autopc run --dry-run "..."   # rehearse: resolve clicks without actuating
-autopc skills                # list the skills it has learned
-autopc memory                # show its persistent memory
-autopc -h                    # full help; `autopc <command> -h` per command
+autopc                          # open the interactive shell
+autopc "open notepad and type hello"     # run one task (same as `autopc run ...`)
+autopc run --dry-run "..."      # rehearse: report every action, perform none
+autopc resume [<id>]            # continue an unfinished task (latest if no id)
+autopc queue "..."              # add a task to the queue (does not run it)
+autopc work                     # work through the queued tasks, oldest first
+autopc tasks                    # list tasks and their status
+autopc skills                   # list the skills it has learned
+autopc memory                   # show its persistent memory
+autopc -h                       # full help; `autopc <command> -h` per command
 ```
 
-**In the shell**, type a task and press Enter. Slash commands: `/help`,
-`/skills`, `/memory`, `/clear` (wipe the working scratchpad, keep learned
-facts), `/quit`.
+`python -m autopc` works the same way.
 
-Input is **live by default**; `--dry-run` (or `AUTOPC_DRY_RUN=1`) reports every
-click, key press and scroll instead of performing it.
+**In the shell**, type a task and press Enter; the agent works it to a verified
+finish. Slash commands: `/help`, `/tasks`, `/resume [id]`, `/skills`,
+`/memory`, `/clear` (wipe the working scratchpad, keep learned facts), `/quit`.
+
+## Safety
+
+- **Dry run.** `--dry-run` (or `AUTOPC_DRY_RUN=1`) turns every input action -
+  click, hover, drag, typing, key presses, navigation, scrolling - into a
+  report of what would have happened.
+- **Ctrl+C** stops the running task at once, including a mouse move or typing
+  already in progress, and saves the task so `resume` can continue it. In the
+  shell, the shell stays open.
+- **Caps.** Each attempt is limited by `--max-turns` (default 80 tool calls) and
+  `--budget` (default 4.0 USD); each task by `--max-attempts` (default 3).
+- **Unattended by design.** The agent never stops to ask for permission, so it
+  is given only its desktop tools: no shell, file or web tools.
+- **Mouse acceleration.** While running, AutoPC turns off Windows "Enhance
+  pointer precision" for click accuracy and restores it on exit (it is not
+  saved, so a crash leaves it off only until you next sign in). Set
+  `AUTOPC_DISABLE_MOUSE_ACCEL=0` to opt out.
 
 
 ## Configuration
@@ -133,28 +178,50 @@ All settings are `AUTOPC_*` environment variables, optionally set in
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `AUTOPC_MODEL` | `claude-sonnet-5-5` | the driver model |
-| `AUTOPC_SOLVER_MODEL` | `claude-opus-5-5` | reasoning/code/skill-distillation model |
 | `AUTOPC_DRY_RUN` | `0` | `1` = report actions instead of performing them |
-| `AUTOPC_DATA_DIR` | `data` | where memory and skills are stored |
+| `AUTOPC_MODEL` | `claude-sonnet-5-5` | the driver model |
+| `AUTOPC_SOLVER_MODEL` | `claude-opus-5-5` | reasoning, definition of done, verifier, reflection, skills |
+| `AUTOPC_SOLVER_EFFORT` | `high` | `low` \| `medium` \| `high` \| `xhigh` \| `max` |
+| `AUTOPC_MAX_ATTEMPTS` | `3` | fresh attempts before a task is marked failed |
+| `AUTOPC_DATA_DIR` | `data` in the AutoPC folder | where memory, skills and tasks are stored |
 | `AUTOPC_EMBEDDER` | `onnx` | `onnx` \| `keyword` \| `none` |
 | `AUTOPC_EMBED_MODEL` | `BAAI/bge-small-en-v1.5` | fastembed model |
 | `AUTOPC_SKILL_MIN_STEPS` | `5` | min steps before a run becomes a skill |
+| `AUTOPC_IMAGE_WIDTH` | native | force a smaller screenshot width |
+| `AUTOPC_DISABLE_MOUSE_ACCEL` | `1` | turn off pointer acceleration while running |
+| `AUTOPC_OMNIPARSER` | `0` | optional learned UI detector (see `.env.template`) |
 
 ---
 
 ## Project layout
 
 ```
-core/         the body - Interception hands, DXGI capture, perception, executor
-agent_brain/  the mind - Claude Agent SDK loop, tools, solver, trace recorder
-memory/       declarative memory - 3-tier store, embedder, vector store
-skills/       procedural memory - SKILL.md manager + crystallizer
-cli.py        the `autopc` command-line interface
-data/         runtime state (gitignored): MEMORY.md, skills/, vector index
+autopc/
+  cli.py        the `autopc` command
+  config.py     settings, paths, model defaults
+  core/         the body - Interception input, DXGI capture, OCR, control
+                detection, executor
+  agent_brain/  the mind - Claude Agent SDK wiring, tools, solver, runner
+  memory/       declarative memory - 3-tier store, embedder, vector store
+  skills/       procedural memory - SKILL.md manager + crystallizer
+  tasks/        goal reinforcement - ledger, contract, verifier, guard hooks,
+                reflection, store
+tests/          unit tests (no screen, driver or network needed)
+data/           runtime state for a source checkout (gitignored)
 ```
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design.
+
+## Development
+
+```bash
+pip install -e ".[dev]"
+pytest
+build.cmd                       # standalone build in dist\AutoPC\ (PyInstaller)
+```
+
+The tests stub the screen, the input driver and the model, so they run without
+Interception or Claude credentials.
 
 ---
 
