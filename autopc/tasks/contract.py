@@ -1,19 +1,19 @@
 """
-Task contract -- turn a goal into a definition of done before acting.
+Task contract -- the definition of done, derived before acting.
 
-"Do X" is ambiguous about when X is finished, and an agent left to decide that
-for itself tends to stop at the first screen that looks plausible. So before the
-first action, the goal is converted into a contract:
+A deliberate NON-goal of this module is to plan the task. The agent's strength
+is on-the-spot adaptability: it holds the goal in mind and decides every step
+from what is actually on the screen, reacting to what it finds rather than
+following a route guessed in advance. A pre-laid plan would work against that --
+and where a reliable HOW already exists, a learned skill (skills/) supplies it
+from real experience, not a guess. So we never prescribe steps.
 
-    criteria   1-6 end-states that are observable on screen (or checkable
-               facts), covering exactly what was asked -- nothing more
-    plan       an ordered first draft of steps (the agent may revise it)
-    assumptions any ambiguity resolved by a reasonable reading of the request
-
-The criteria are what the independent verifier later checks a completion claim
-against (tasks/verifier.py). They are written once per task and never relaxed
-by the acting agent -- that is the core of task reinforcement: the target does
-not move to meet the work.
+What we DO derive up front is the definition of done: 1-6 conditions that are
+observable on screen (or checkable facts) and that, together, mean the request
+is fully satisfied. This is the WHAT, not the HOW. It does not constrain how the
+agent works; it is the finish line the independent verifier (tasks/verifier.py)
+checks a completion claim against -- which is what stops the agent declaring
+victory early. The criteria are written once and never relaxed by the actor.
 
 If the contract call fails, a conservative fallback is used: one criterion that
 restates the goal as a visible end-state. The task can always proceed.
@@ -33,12 +33,15 @@ CONTRACT_SYSTEM = """\
 You write the definition of done for a desktop automation agent that operates a
 real Windows PC by looking at the screen and using the mouse and keyboard.
 
+You do NOT plan the task or list steps -- the agent decides how to do it in the
+moment, adapting to what it sees. Your only job is to state WHAT "done" means.
+
 Given the user's request, produce:
 
 criteria -- 1 to 6 conditions that, together, mean the request is fully done.
   * Each is an END-STATE you could confirm by looking at the screen (or a
-    checkable fact), NOT an action. Write "Notepad shows the text 'hello'", not
-    "type hello".
+    checkable fact), NOT an action or a step. Write "Notepad shows the text
+    'hello'", never "type hello" or "open Notepad".
   * Cover EVERYTHING the user asked for, and NOTHING they did not. No extra
     polish, no side tasks, no "also make sure..." the user never requested.
   * Use the exact names, values, and text from the request.
@@ -46,28 +49,27 @@ criteria -- 1 to 6 conditions that, together, mean the request is fully done.
     submit, book, install), include a criterion that confirms it actually
     happened (e.g. "the title bar shows the saved filename with no unsaved
     marker", "a 'message sent' confirmation is visible").
-plan -- 2 to 10 short, concrete, ordered steps to get there.
-assumptions -- any ambiguity you resolved, stated briefly (empty if none).
+  * Keep each criterion to what is genuinely necessary. Fewer, sharper criteria
+    are better than many fussy ones.
+assumptions -- any ambiguity you resolved by a reasonable reading of the
+  request, stated briefly (empty list if none).
 """
 
 CONTRACT_SCHEMA: Dict[str, Any] = {
     "type": "object",
     "properties": {
         "criteria": {"type": "array", "items": {"type": "string"}},
-        "plan": {"type": "array", "items": {"type": "string"}},
         "assumptions": {"type": "array", "items": {"type": "string"}},
     },
-    "required": ["criteria", "plan"],
+    "required": ["criteria"],
 }
 
 MAX_CRITERIA = 6
-MAX_PLAN = 10
 
 
 @dataclass
 class Contract:
     criteria: List[str]
-    plan: List[str]
     assumptions: List[str] = field(default_factory=list)
     fallback: bool = False
 
@@ -75,7 +77,6 @@ class Contract:
 def fallback_contract(goal: str) -> Contract:
     return Contract(
         criteria=[f"The requested outcome is visibly complete on screen: {goal.strip()}"],
-        plan=[goal.strip()],
         fallback=True,
     )
 
@@ -96,33 +97,31 @@ def _clean(items: Any, limit: int) -> List[str]:
 async def derive_contract(goal: str, context: str = "",
                           generate_json: Optional[JsonFn] = None,
                           model: Optional[str] = None) -> Contract:
-    """Build the contract for `goal`. `context` may carry relevant memory or a
-    matched skill so the plan starts from experience. Never raises."""
+    """Derive the definition of done for `goal`. `context` may carry relevant
+    memory or a matched skill. Never raises; never produces a plan."""
     if generate_json is None:
         from autopc.agent_brain.llm import generate_json as _gj
         generate_json = _gj
     model = model or os.environ.get("AUTOPC_PLANNER_MODEL") or None
     prompt = f"User request:\n{goal.strip()}"
     if context.strip():
-        prompt += f"\n\nWhat the agent already knows (use it to make the plan concrete):\n{context.strip()}"
+        prompt += ("\n\nWhat the agent already knows (background only -- do NOT turn "
+                   f"this into steps):\n{context.strip()}")
     try:
         data = await generate_json(prompt, CONTRACT_SCHEMA, system=CONTRACT_SYSTEM, model=model)
     except Exception as exc:
         log.warning("Contract generation failed (%s); using fallback.", exc)
         return fallback_contract(goal)
     criteria = _clean(data.get("criteria"), MAX_CRITERIA)
-    plan = _clean(data.get("plan"), MAX_PLAN)
     if not criteria:
         return fallback_contract(goal)
-    return Contract(criteria=criteria, plan=plan or [goal.strip()],
-                    assumptions=_clean(data.get("assumptions"), 6))
+    return Contract(criteria=criteria, assumptions=_clean(data.get("assumptions"), 6))
 
 
 def apply_contract(ledger, contract: Contract) -> None:
-    """Write a contract into a task ledger (criteria + initial plan)."""
+    """Write a contract's definition of done into a task ledger. No plan is set:
+    the agent improvises the steps and may keep its own plan if it chooses."""
     ledger.set_criteria(contract.criteria)
-    ledger.set_plan([{"text": s, "status": "in_progress" if i == 0 else "pending"}
-                     for i, s in enumerate(contract.plan)])
     note = f"Definition of done set ({len(contract.criteria)} criteria"
     note += ", fallback)" if contract.fallback else ")"
     if contract.assumptions:

@@ -90,13 +90,31 @@ class TaskRunner:
 
     def _attempt_prompt(self, ledger: TaskLedger, attempt_n: int) -> str:
         blocks = [
-            "You are an autonomous desktop agent. Completing the task below is your "
-            "ONLY objective for this session. Work until every criterion in the "
-            "definition of done is visibly met on screen, then call "
-            "complete_task(success=true). You run unattended: never wait for or ask "
-            "the user -- make the reasonable choice and proceed.",
-            ledger.report(),
+            f"## Your goal (your only objective)\n{ledger.goal}",
+            "You are an autonomous desktop agent. Completing the goal above is the "
+            "entire point of this session. Work it out AS YOU GO -- decide every "
+            "step from what is actually on the screen, and adapt freely to whatever "
+            "you find. There is no prescribed plan; do not make a rigid one. You run "
+            "unattended: never wait for or ask the user -- make the reasonable choice "
+            "and keep moving.",
+            # The definition of done is the ACCEPTANCE TEST, not a route. It tells
+            # the agent what the independent verifier will check -- so it is shown,
+            # but framed as the finish line, not steps.
+            "## How completion is judged\n"
+            "When you believe the goal is done, call complete_task(success=true). A "
+            "separate check then looks at a fresh screenshot and confirms ALL of "
+            "these are true on screen before the task counts as done:\n"
+            + "\n".join(f"  - {c.id}: {c.text}" for c in ledger.criteria)
+            + "\nClaiming before they are visibly true just gets you sent back, so "
+            "confirm them yourself first. Use your judgement -- the goal is the real "
+            "objective and these are how it will be measured.",
         ]
+        if ledger.lessons:
+            blocks.append("## Lessons from earlier attempts\n"
+                          + "\n".join(f"  - {l}" for l in ledger.lessons[-8:]))
+        if ledger.progress and attempt_n == 1 and len(ledger.progress) > 2:
+            blocks.append("## Progress so far (you are resuming)\n"
+                          + "\n".join(f"  - {p['note']}" for p in ledger.progress[-6:]))
         mem = desktop.memory_preamble()
         if mem.strip():
             blocks.append("## What you already know\n" + mem)
@@ -108,11 +126,11 @@ class TaskRunner:
             blocks.append("## Related past attempts (yours)\n" + eps)
         if attempt_n > 1:
             blocks.append(
-                f"## This is attempt {attempt_n}\nEarlier attempts did not finish the "
-                "task. Read the lessons above and take a DIFFERENT approach -- repeating "
-                "what already failed will fail again. Start by calling task_status and "
-                "observe to re-ground yourself.")
-        blocks.append("Begin now: call observe to see the screen, then act.")
+                f"## This is attempt {attempt_n}\nAn earlier attempt did not finish the "
+                "goal. Read the lessons above and take a genuinely DIFFERENT approach -- "
+                "repeating what already failed will fail again. Re-ground yourself with "
+                "observe first.")
+        blocks.append("Begin now: observe the screen, then act.")
         return "\n\n".join(blocks)
 
     # --------------------------------------------------------------- driving

@@ -17,15 +17,14 @@ async def _returns(data):
 async def test_contract_cleans_dedupes_and_caps():
     gen = await _returns({
         "criteria": ["  Notepad   shows 'hi' ", "notepad shows 'hi'", ""] + [f"c{i}" for i in range(10)],
-        "plan": ["open notepad", "type hi"],
         "assumptions": ["default font is fine"],
     })
     c = await derive_contract("open notepad and type hi", generate_json=gen)
     assert c.criteria[0] == "Notepad shows 'hi'"
     assert len(c.criteria) == MAX_CRITERIA          # deduped, empty dropped, capped
-    assert c.plan == ["open notepad", "type hi"]
     assert c.assumptions == ["default font is fine"]
     assert not c.fallback
+    assert not hasattr(c, "plan")                   # the contract never plans steps
 
 
 @pytest.mark.asyncio
@@ -39,21 +38,21 @@ async def test_contract_falls_back_when_model_errors():
 
 @pytest.mark.asyncio
 async def test_contract_falls_back_on_empty_criteria():
-    gen = await _returns({"criteria": [], "plan": ["x"]})
+    gen = await _returns({"criteria": []})
     c = await derive_contract("do the thing", generate_json=gen)
     assert c.fallback
 
 
 @pytest.mark.asyncio
 async def test_context_reaches_the_prompt():
-    gen = await _returns({"criteria": ["done"], "plan": ["a"]})
+    gen = await _returns({"criteria": ["done"]})
     await derive_contract("goal", context="Edge's address bar is at the top", generate_json=gen)
     assert "Edge's address bar" in gen.prompt
 
 
-def test_apply_contract_sets_first_step_in_progress(tmp_path):
+def test_apply_contract_sets_criteria_but_no_plan(tmp_path):
     t = TaskStore(str(tmp_path)).create("goal")
     apply_contract(t, fallback_contract("goal"))
     assert len(t.criteria) == 1
-    assert t.plan[0].status == "in_progress"
+    assert t.plan == []                              # the agent plans for itself, if at all
     assert "fallback" in t.progress[-1]["note"]
